@@ -67,6 +67,7 @@ async function createApp(
       storedVersion: "1.0.0",
       packageVersion: "1.0.0",
       manifestPresent: true,
+      hashVerified: true,
     })),
     ...loaderOverrides,
   };

@@ -301,6 +301,57 @@ describe("plugin capability drift", () => {
       expect(drift.packageReadable).toBe(false);
       expect(drift.error).toBeTruthy();
     });
+
+    it("backfills a legacy row's missing hash instead of reporting it verified", async () => {
+      await writePackage(packageRoot, "1.0.0", BASE_CAPABILITIES);
+      // No `manifestSourceHash` set: a row written before that column existed.
+      const plugin = createPluginRecord({ packagePath: packageRoot, manifestSourceHash: null });
+
+      const drift = await createLoader(tmpRoot).inspectManifestDrift(plugin as never);
+
+      // Same version, so nothing to compare the just-established baseline
+      // against yet — reported as unverified, not as a clean "no drift".
+      expect(drift.drifted).toBe(false);
+      expect(drift.hashVerified).toBe(false);
+      expect(mockRegistry.update).toHaveBeenCalledWith(
+        plugin.id,
+        expect.objectContaining({ manifestSourceHash: expect.any(String) }),
+      );
+    });
+
+    it("reports the second check as verified once the hash is backfilled", async () => {
+      await writePackage(packageRoot, "1.0.0", BASE_CAPABILITIES);
+      const plugin = createPluginRecord({ packagePath: packageRoot, manifestSourceHash: null });
+      const loader = createLoader(tmpRoot);
+
+      await loader.inspectManifestDrift(plugin as never);
+      const backfilled = mockRegistry.update.mock.calls.at(-1)?.[1]?.manifestSourceHash as string;
+
+      const drift = await loader.inspectManifestDrift(
+        { ...plugin, manifestSourceHash: backfilled } as never,
+      );
+
+      expect(drift.hashVerified).toBe(true);
+      expect(drift.drifted).toBe(false);
+    });
+
+    it("catches a same-version content swap once a baseline hash exists", async () => {
+      await writePackage(packageRoot, "1.0.0", BASE_CAPABILITIES);
+      const loader = createLoader(tmpRoot);
+      const plugin = createPluginRecord({ packagePath: packageRoot, manifestSourceHash: null });
+      await loader.inspectManifestDrift(plugin as never);
+      const baselineHash = mockRegistry.update.mock.calls.at(-1)?.[1]?.manifestSourceHash as string;
+
+      // Package replaced in place under the same version — the case a
+      // version-only comparison would miss entirely.
+      await writePackage(packageRoot, "1.0.0", [...BASE_CAPABILITIES, ADDED_CAPABILITY]);
+      const driftAfterSwap = await loader.inspectManifestDrift(
+        { ...plugin, manifestSourceHash: baselineHash } as never,
+      );
+
+      expect(driftAfterSwap.hashVerified).toBe(true);
+      expect(driftAfterSwap.drifted).toBe(true);
+    });
   });
 
   /**

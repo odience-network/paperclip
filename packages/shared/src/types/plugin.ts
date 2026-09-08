@@ -795,6 +795,15 @@ export interface PluginManifestDrift {
   packageVersion: string | null;
   /** False when the package no longer exposes a manifest entrypoint at all. */
   manifestPresent: boolean;
+  /**
+   * False when a same-version package swap couldn't be ruled out because no
+   * source hash existed to compare against — a row written before
+   * `manifestSourceHash` existed, now backfilled from this check so the
+   * *next* check is conclusive. This pass can't see a swap that happened
+   * before the backfill, so callers should not treat `drifted: false`
+   * alongside `hashVerified: false` as a clean bill of health.
+   */
+  hashVerified: boolean;
   /** Why the package could not be read, when `packageReadable` is false. */
   error?: string;
 }

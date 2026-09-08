@@ -582,6 +582,7 @@ export function pluginRoutes(
         storedVersion: plugin.version,
         packageVersion: null,
         manifestPresent: false,
+        hashVerified: false,
         error: err instanceof Error ? err.message : String(err),
       };
     }
@@ -2201,6 +2202,18 @@ export function pluginRoutes(
           + `capability grant. `
           + `Run POST /api/plugins/${plugin.id}/upgrade to see the capabilities it adds and approve them.`,
       });
+    } else if (!drift.hashVerified) {
+      // A same-version package swap prior to this check is invisible: there
+      // was no stored hash to compare against. The check just backfilled one,
+      // so it's neutral rather than a pass — the *next* check is conclusive.
+      checks.push({
+        name: "manifest_drift",
+        passed: false,
+        message:
+          "Stored manifest version matches the package on disk, but no source hash was recorded "
+          + "for this plugin yet, so a same-version package swap before now can't be ruled out. "
+          + "A baseline hash has just been recorded; the next health check will be conclusive.",
+      });
     } else {
       checks.push({
         name: "manifest_drift",
@@ -2213,7 +2226,8 @@ export function pluginRoutes(
       pluginId: plugin.id,
       status: plugin.status,
       healthy:
-        isHealthy && hasValidManifest && hasNoError && drift.packageReadable && !drift.drifted,
+        isHealthy && hasValidManifest && hasNoError && drift.packageReadable && !drift.drifted
+        && drift.hashVerified,
       checks,
       lastError: plugin.lastError ?? undefined,
     };

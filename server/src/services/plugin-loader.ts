@@ -1463,6 +1463,7 @@ export function pluginLoader(
       storedVersion: plugin.version,
       packageVersion: null,
       manifestPresent: false,
+      hashVerified: false,
     };
 
     let pkgJson: Record<string, unknown> | null;
@@ -1491,18 +1492,30 @@ export function pluginLoader(
       };
     }
 
-    // Rows written before `manifestSourceHash` existed carry `null` until
-    // their next install/upgrade/activation; fall back to the version-only
-    // comparison for those instead of reporting a false drift.
+    // Rows written before `manifestSourceHash` existed carry `null`. Reading
+    // the hash never executes plugin code (see `hashManifestSource`), so
+    // rather than wait for the row's next install/upgrade/activation to
+    // backfill it, establish the baseline right here on the read path. This
+    // pass still can't rule out a swap that happened *before* the backfill —
+    // there's nothing to compare the freshly-read hash against yet — so it
+    // reports `hashVerified: false` instead of folding into `drifted`, and
+    // callers must not read `drifted: false` alone as "no drift possible".
     let hashMismatch = false;
+    let hashVerified = plugin.manifestSourceHash != null;
     if (plugin.manifestSourceHash != null) {
       const currentHash = await hashManifestSource(resolvePluginPackageRoot(plugin, localPluginDir));
       hashMismatch = currentHash !== plugin.manifestSourceHash;
+    } else if (packageVersion === plugin.version) {
+      const currentHash = await hashManifestSource(resolvePluginPackageRoot(plugin, localPluginDir));
+      if (currentHash != null) {
+        await registry.update(plugin.id, { manifestSourceHash: currentHash });
+      }
     }
 
     return {
       packageReadable: true,
       drifted: packageVersion !== plugin.version || hashMismatch,
+      hashVerified,
       storedVersion: plugin.version,
       packageVersion,
       manifestPresent: true,

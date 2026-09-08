@@ -952,6 +952,14 @@ The host must make that difference observable rather than silent:
 - Activation adopts the on-disk manifest and logs a warning naming every
   capability granted that the stored manifest did not carry.
 
+Rows written before `manifestSourceHash` existed carry `null` and have no
+baseline to compare a same-version swap against. Rather than report those as
+drift-free, both read paths treat them as unverified (`hashVerified: false`,
+`healthy: false`) and backfill the hash from the on-disk manifest's raw bytes
+— still without importing it — on that same check. This can't detect a swap
+that happened *before* the backfill, but the next check onward is conclusive,
+so the unverified state self-clears after one read.
+
 Neither read path may name the drifted capabilities, because computing that
 delta requires importing the manifest module, and read paths must never
 execute package code on an ordinary metadata or health request. They compare
