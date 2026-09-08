@@ -2,8 +2,8 @@
  * Capability grants must not drift from the package that is actually running.
  *
  * The stored manifest is the grant of record — `buildHostHandlers` gates every
- * worker→host call on `manifestJson.capabilities`. Two host behaviours used to
- * combine badly around that:
+ * worker→host call on `manifestJson.capabilities`. Three host behaviours used
+ * to combine badly around that:
  *
  * 1. `upgradePlugin` threw on any upgrade that added a capability, telling the
  *    operator that "approval" was required when no approval path existed. The
@@ -12,12 +12,20 @@
  * 2. A package swapped on disk left the stored manifest untouched until the
  *    next activation, so the new code ran against the old capability set and
  *    every call needing a new capability was denied with nothing reporting why.
+ * 3. The `enable` gate on a held upgrade used to re-read the on-disk package
+ *    to compute the capability delta, which meant an ordinary `enable` call
+ *    executed the unapproved package's manifest module. It also compared
+ *    against `package.json`'s `version` field alone, which misses same-version
+ *    content edits (a manifest hand-edited without a version bump).
  *
  * `upgradePlugin` now reports the escalation instead of throwing and applies it
- * only against an explicit approval, and `inspectManifestDrift` makes the
- * stored-vs-disk difference observable without executing the package: read
- * routes report version drift from `package.json`, while the capability delta
- * stays on the lifecycle paths that load the manifest module anyway.
+ * only against an explicit approval. The manifest it loaded while doing so —
+ * the one legitimate, operator-invoked point where the package's code may run
+ * — is persisted as `pendingManifestJson` alongside the `upgrade_pending`
+ * status. `inspectManifestDrift` (the read path) answers from inert
+ * `package.json` data plus a content hash (`manifestSourceHash`) rather than
+ * importing the manifest module, and the `enable` gate diffs the persisted
+ * `pendingManifestJson` in memory instead of re-reading the package.
  */
 import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
@@ -296,73 +304,37 @@ describe("plugin capability drift", () => {
   });
 
   /**
-   * The capability delta needs the manifest module, so it stays on the
-   * lifecycle paths that load the package anyway — the `enable` gate below.
-   */
-  describe("inspectPackageCapabilityDrift", () => {
-    it("reports capabilities the package declares but the stored grant lacks", async () => {
-      await writePackage(packageRoot, "1.1.0", [...BASE_CAPABILITIES, ADDED_CAPABILITY]);
-      const plugin = createPluginRecord({ packagePath: packageRoot });
-
-      const drift = await createLoader(tmpRoot).inspectPackageCapabilityDrift(plugin as never);
-
-      expect(drift.packageReadable).toBe(true);
-      expect(drift.drifted).toBe(true);
-      expect(drift.packageVersion).toBe("1.1.0");
-      expect(drift.addedCapabilities).toEqual([ADDED_CAPABILITY]);
-      expect(drift.removedCapabilities).toEqual([]);
-      // This path does load the manifest — that is the difference.
-      expect(existsSync(manifestLoadMarker)).toBe(true);
-    });
-
-    it("reports capabilities still granted that the package dropped", async () => {
-      await writePackage(packageRoot, "2.0.0", ["issues.read"]);
-      const plugin = createPluginRecord({ packagePath: packageRoot });
-
-      const drift = await createLoader(tmpRoot).inspectPackageCapabilityDrift(plugin as never);
-
-      expect(drift.addedCapabilities).toEqual([]);
-      expect(drift.removedCapabilities).toEqual(["issue.comments.read"]);
-    });
-
-    it("reports no drift when the package matches the stored manifest", async () => {
-      await writePackage(packageRoot, "1.0.0", BASE_CAPABILITIES);
-      const plugin = createPluginRecord({ packagePath: packageRoot });
-
-      const drift = await createLoader(tmpRoot).inspectPackageCapabilityDrift(plugin as never);
-
-      expect(drift.drifted).toBe(false);
-      expect(drift.addedCapabilities).toEqual([]);
-      expect(drift.removedCapabilities).toEqual([]);
-    });
-
-    it("reports an unreadable package instead of throwing", async () => {
-      const plugin = createPluginRecord({ packagePath: path.join(tmpRoot, "missing") });
-
-      const drift = await createLoader(tmpRoot).inspectPackageCapabilityDrift(plugin as never);
-
-      expect(drift.packageReadable).toBe(false);
-      expect(drift.error).toBeTruthy();
-      expect(drift.addedCapabilities).toEqual([]);
-    });
-  });
-
-  /**
-   * Holding the upgrade is only a gate if it cannot be walked around. The
-   * held package stays on disk and activation adopts the on-disk manifest, so
-   * `enable` on an `upgrade_pending` plugin would otherwise grant exactly the
-   * capabilities the operator declined to approve.
+   * Holding the upgrade is only a gate if it cannot be walked around.
+   * `upgrade()` persists the manifest it already loaded as
+   * `pendingManifestJson`; `enable` must diff that persisted snapshot rather
+   * than re-reading the (unapproved) package from disk, or an ordinary
+   * `enable` call would execute untrusted top-level code and — if it read
+   * `package.json` alone — could adopt a manifest that changed content
+   * without a version bump.
    */
   describe("enable on a held upgrade", () => {
     function createLifecycle(localPluginDir: string) {
       return pluginLifecycleManager({} as unknown as Db, createLoader(localPluginDir));
     }
 
+    function pendingManifest(capabilities: PluginCapability[], version = "1.1.0") {
+      return {
+        id: "example.drift-plugin",
+        apiVersion: 1,
+        version,
+        displayName: "Drift Plugin",
+        description: "Fixture plugin for capability drift tests",
+        author: "Test",
+        categories: ["connector"],
+        capabilities,
+        entrypoints: { worker: "worker.js" },
+      };
+    }
+
     it("refuses to enable a pending upgrade that would grant unapproved capabilities", async () => {
-      await writePackage(packageRoot, "1.1.0", [...BASE_CAPABILITIES, ADDED_CAPABILITY]);
       const plugin = createPluginRecord({
-        packagePath: packageRoot,
         status: "upgrade_pending",
+        pendingManifestJson: pendingManifest([...BASE_CAPABILITIES, ADDED_CAPABILITY]),
       });
       mockRegistry.getById.mockResolvedValue(plugin);
 
@@ -372,15 +344,31 @@ describe("plugin capability drift", () => {
       // Neither the status nor the grant of record moved.
       expect(mockRegistry.updateStatus).not.toHaveBeenCalled();
       expect(mockRegistry.update).not.toHaveBeenCalled();
+      // The refusal is decided from the persisted snapshot alone — no
+      // package on disk was ever written for this test, so anything that
+      // tried to load one would fail loudly rather than pass silently.
     });
 
-    it("enables a pending upgrade once the package adds nothing over the stored grant", async () => {
-      // What an approved upgrade leaves behind: the package on disk and the
-      // stored manifest declare the same capabilities.
-      await writePackage(packageRoot, "1.1.0", BASE_CAPABILITIES);
+    it("never executes package code while evaluating a held upgrade", async () => {
+      // A package left on disk for a held upgrade is, by definition, not yet
+      // approved — the check must never import it, whatever it contains.
+      await writePackage(packageRoot, "1.1.0", [...BASE_CAPABILITIES, ADDED_CAPABILITY]);
       const plugin = createPluginRecord({
         packagePath: packageRoot,
         status: "upgrade_pending",
+        pendingManifestJson: pendingManifest([...BASE_CAPABILITIES, ADDED_CAPABILITY]),
+      });
+      mockRegistry.getById.mockResolvedValue(plugin);
+
+      await expect(createLifecycle(tmpRoot).enable(plugin.id)).rejects.toThrow();
+
+      expect(existsSync(manifestLoadMarker)).toBe(false);
+    });
+
+    it("enables a pending upgrade once the pending manifest adds nothing over the stored grant", async () => {
+      const plugin = createPluginRecord({
+        status: "upgrade_pending",
+        pendingManifestJson: pendingManifest(BASE_CAPABILITIES),
       });
       mockRegistry.getById.mockResolvedValue(plugin);
       mockRegistry.updateStatus.mockResolvedValue({ ...plugin, status: "ready" });
@@ -394,22 +382,24 @@ describe("plugin capability drift", () => {
       );
     });
 
-    it("refuses to enable a pending upgrade whose package cannot be read", async () => {
+    it("refuses to enable a pending upgrade with no recorded pending manifest", async () => {
+      // A row from before `pendingManifestJson` existed, or one that lost it
+      // some other way: there is nothing to show the escalation is empty, so
+      // this must fail closed rather than assume it is safe.
       const plugin = createPluginRecord({
-        packagePath: path.join(tmpRoot, "missing"),
         status: "upgrade_pending",
+        pendingManifestJson: null,
       });
       mockRegistry.getById.mockResolvedValue(plugin);
 
       await expect(createLifecycle(tmpRoot).enable(plugin.id)).rejects.toThrow(
-        /could not be read/,
+        /no recorded pending manifest/,
       );
       expect(mockRegistry.updateStatus).not.toHaveBeenCalled();
     });
 
     it("still enables a disabled plugin without inspecting a pending upgrade", async () => {
-      await writePackage(packageRoot, "1.0.0", BASE_CAPABILITIES);
-      const plugin = createPluginRecord({ packagePath: packageRoot, status: "disabled" });
+      const plugin = createPluginRecord({ status: "disabled" });
       mockRegistry.getById.mockResolvedValue(plugin);
       mockRegistry.updateStatus.mockResolvedValue({ ...plugin, status: "ready" });
 

@@ -27,6 +27,7 @@
 import { existsSync } from "node:fs";
 import { readdir, readFile, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -37,7 +38,6 @@ import type {
   PaperclipPluginManifestV1,
   PluginLauncherDeclaration,
   PluginManifestDrift,
-  PluginPackageCapabilityDrift,
   PluginRecord,
   PluginUiSlotDeclaration,
 } from "@paperclipai/shared";
@@ -348,7 +348,7 @@ export interface PluginInstallOptions {
  * and the UI client all read the same shape; re-exported here for the existing
  * server-side importers.
  */
-export type { PluginManifestDrift, PluginPackageCapabilityDrift } from "@paperclipai/shared";
+export type { PluginManifestDrift } from "@paperclipai/shared";
 
 // ---------------------------------------------------------------------------
 // Runtime options — services needed for initializing loaded plugins
@@ -581,23 +581,23 @@ export interface PluginLoader {
 
   /**
    * Compare the grant stored for an installed plugin against the package
-   * currently on disk, reading `package.json` only.
+   * currently on disk.
    *
-   * Safe on read routes: a v1 manifest is an executable module, so this never
-   * touches it. Never throws either — an unreadable or missing package comes
-   * back as `packageReadable: false` with the reason in `error`, so health
-   * checks and detail routes can report drift without failing.
+   * Safe on read routes: `package.json` is inert JSON, and the manifest file
+   * is only ever read as raw bytes and hashed — never imported — so this
+   * never executes plugin code. That also means it catches a package
+   * replaced in place under the *same* `package.json` version, not just a
+   * version bump. Never throws either — an unreadable or missing package
+   * comes back as `packageReadable: false` with the reason in `error`, so
+   * health checks and detail routes can report drift without failing.
+   *
+   * This does not report *which* capabilities changed: that delta needs the
+   * manifest module, and read routes must never execute it. The capability
+   * delta for a held upgrade is captured once, at the operator-invoked
+   * `upgrade()` call, and persisted on the plugin record as
+   * `pendingManifestJson` — see PLUGIN_SPEC.md §15.4.
    */
   inspectManifestDrift(plugin: PluginRecord): Promise<PluginManifestDrift>;
-
-  /**
-   * Same comparison, plus the capability delta.
-   *
-   * Loads the package's manifest module, which runs its top-level code. Only
-   * call it from lifecycle operations that already load the package; read
-   * routes must use `inspectManifestDrift`.
-   */
-  inspectPackageCapabilityDrift(plugin: PluginRecord): Promise<PluginPackageCapabilityDrift>;
 
   /**
    * Check whether a plugin API version is supported by this host.
@@ -1424,12 +1424,33 @@ export function pluginLoader(
   }
 
   /**
+   * sha256 of the manifest module's raw source bytes, read from disk without
+   * importing (so it never executes plugin code). Captured alongside the
+   * manifest at every legitimate load point (install, approved upgrade,
+   * activation refresh) so diagnostic read routes can detect a package
+   * swapped in place under the *same* `package.json` version — a version
+   * bump alone misses that case (§15.4).
+   */
+  async function hashManifestSource(packageRoot: string): Promise<string | null> {
+    const pkgJson = await readPackageJson(packageRoot);
+    if (!pkgJson) return null;
+
+    const manifestPath = resolveManifestPath(packageRoot, pkgJson);
+    if (!manifestPath || !existsSync(manifestPath)) return null;
+
+    const bytes = await readFile(manifestPath);
+    return createHash("sha256").update(bytes).digest("hex");
+  }
+
+  /**
    * Compare the stored grant against the package on disk without executing any
    * plugin code: a v1 manifest is a module, and importing one from a read route
    * would run its top-level code on an ordinary metadata or health request.
    *
-   * `package.json` is inert JSON, and the version it declares is enough to tell
-   * a stored grant apart from the package actually running. The exact
+   * `package.json` is inert JSON and safe to read directly. The manifest file
+   * itself is also read as raw bytes — never imported — and hashed, so a
+   * package replaced in place under the *same* `package.json` version is
+   * still visible as drift; comparing versions alone would miss it. The exact
    * capability delta needs the manifest module, so it belongs to the upgrade
    * path, which loads it under approval.
    */
@@ -1470,9 +1491,18 @@ export function pluginLoader(
       };
     }
 
+    // Rows written before `manifestSourceHash` existed carry `null` until
+    // their next install/upgrade/activation; fall back to the version-only
+    // comparison for those instead of reporting a false drift.
+    let hashMismatch = false;
+    if (plugin.manifestSourceHash != null) {
+      const currentHash = await hashManifestSource(resolvePluginPackageRoot(plugin, localPluginDir));
+      hashMismatch = currentHash !== plugin.manifestSourceHash;
+    }
+
     return {
       packageReadable: true,
-      drifted: packageVersion !== plugin.version,
+      drifted: packageVersion !== plugin.version || hashMismatch,
       storedVersion: plugin.version,
       packageVersion,
       manifestPresent: true,
@@ -1493,7 +1523,16 @@ export function pluginLoader(
       );
     }
 
-    if (JSON.stringify(manifest) === JSON.stringify(plugin.manifestJson)) {
+    const manifestSourceHash = await hashManifestSource(packageRoot);
+
+    // Compare the hash too, not just the parsed manifest: it backfills
+    // `manifestSourceHash` for rows written before that column existed, on
+    // the first activation after upgrading the host, even when the manifest
+    // content itself hasn't changed.
+    if (
+      JSON.stringify(manifest) === JSON.stringify(plugin.manifestJson)
+      && manifestSourceHash === plugin.manifestSourceHash
+    ) {
       return plugin;
     }
 
@@ -1521,6 +1560,7 @@ export function pluginLoader(
       packageName: plugin.packageName,
       version: manifest.version,
       manifest,
+      manifestSourceHash,
     });
 
     return {
@@ -1529,6 +1569,7 @@ export function pluginLoader(
       apiVersion: manifest.apiVersion,
       categories: manifest.categories,
       manifestJson: manifest,
+      manifestSourceHash,
     };
   }
 
@@ -1845,6 +1886,7 @@ export function pluginLoader(
     async installPlugin(installOptions: PluginInstallOptions): Promise<DiscoveredPlugin> {
       const discovered = await fetchAndValidate(installOptions);
       const manifest = discovered.manifest!;
+      const manifestSourceHash = await hashManifestSource(discovered.packagePath);
 
       // Step 6: Persist install record and apply plugin-owned schema migrations
       // in one database transaction. If migration validation fails, the plugin
@@ -1859,6 +1901,7 @@ export function pluginLoader(
             packagePath: discovered.source === "local-filesystem" ? discovered.packagePath : undefined,
           },
           manifest,
+          manifestSourceHash,
         );
 
         if (!installed) {
@@ -1965,10 +2008,14 @@ export function pluginLoader(
       const unapproved = escalated.filter((c) => !approved.has(c));
 
       if (unapproved.length > 0) {
-        // Do NOT persist the new manifest: the stored capability list is the
-        // grant the host enforces at runtime, so writing it here would grant
-        // the escalation. The package stays on disk and the caller parks the
-        // plugin in `upgrade_pending` until an operator approves (§15.3).
+        // Do NOT persist the new manifest as the grant: the stored capability
+        // list is what the host enforces at runtime, so writing it here would
+        // grant the escalation. The caller (plugin-lifecycle's `upgrade()`)
+        // persists `newManifest` as `pendingManifestJson` when it parks the
+        // plugin in `upgrade_pending` — it was already loaded by this
+        // operator-invoked call, the one legitimate point where the
+        // package's code may run, so the enable gate can later diff it
+        // without re-importing the manifest module (§15.3, §15.4).
         log.warn(
           {
             pluginId,
@@ -2000,6 +2047,10 @@ export function pluginLoader(
         packageName: discovered.packageName,
         version: discovered.version,
         manifest: newManifest,
+        manifestSourceHash: await hashManifestSource(discovered.packagePath),
+        // Approval completes the escalation this upgrade was parked for (or
+        // there was none) — no manifest is left awaiting approval.
+        pendingManifest: null,
       });
 
       return {
@@ -2017,61 +2068,6 @@ export function pluginLoader(
 
     async inspectManifestDrift(plugin: PluginRecord): Promise<PluginManifestDrift> {
       return inspectManifestDriftFromPackageJson(plugin);
-    },
-
-    // -----------------------------------------------------------------------
-    // inspectPackageCapabilityDrift
-    // -----------------------------------------------------------------------
-
-    async inspectPackageCapabilityDrift(
-      plugin: PluginRecord,
-    ): Promise<PluginPackageCapabilityDrift> {
-      const storedManifest = plugin.manifestJson;
-      const storedCaps = storedManifest?.capabilities ?? [];
-      const drift = await inspectManifestDriftFromPackageJson(plugin);
-      const base: PluginPackageCapabilityDrift = {
-        ...drift,
-        addedCapabilities: [],
-        removedCapabilities: [],
-      };
-      if (!drift.packageReadable || !drift.manifestPresent) return base;
-
-      // Loading the manifest runs the package's top-level code. Callers are
-      // lifecycle operations that load the package anyway.
-      let packageManifest: PaperclipPluginManifestV1 | null = null;
-      try {
-        const packageRoot = resolvePluginPackageRoot(plugin, localPluginDir);
-        packageManifest = await loadManifestFromPackageRoot(packageRoot);
-        if (!packageManifest) {
-          return {
-            ...base,
-            packageReadable: false,
-            drifted: false,
-            error: "Package on disk does not expose a Paperclip manifest",
-          };
-        }
-      } catch (err) {
-        return {
-          ...base,
-          packageReadable: false,
-          drifted: false,
-          error: err instanceof Error ? err.message : String(err),
-        };
-      }
-
-      const packageCaps = packageManifest.capabilities ?? [];
-      const storedCapSet = new Set(storedCaps);
-      const packageCapSet = new Set(packageCaps);
-
-      return {
-        packageReadable: true,
-        drifted: JSON.stringify(packageManifest) !== JSON.stringify(storedManifest),
-        storedVersion: plugin.version,
-        packageVersion: packageManifest.version,
-        manifestPresent: true,
-        addedCapabilities: packageCaps.filter((c) => !storedCapSet.has(c)),
-        removedCapabilities: storedCaps.filter((c) => !packageCapSet.has(c)),
-      };
     },
 
     // -----------------------------------------------------------------------

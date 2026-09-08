@@ -40,7 +40,6 @@ import type { Db } from "@paperclipai/db";
 import type {
   PluginStatus,
   PluginRecord,
-  PluginPackageCapabilityDrift,
   PaperclipPluginManifestV1,
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "./plugin-registry.js";
@@ -370,6 +369,13 @@ export function pluginLifecycleManager(
     to: PluginStatus,
     lastError: string | null = null,
     existingPlugin?: PluginRecord,
+    /**
+     * Manifest to record as the pending escalation when `to` is
+     * `upgrade_pending`. Ignored for every other target status — leaving it
+     * unset there clears any stale pending manifest, since one may only exist
+     * while the plugin is actually in `upgrade_pending`.
+     */
+    pendingManifest?: PaperclipPluginManifestV1 | null,
   ): Promise<PluginRecord> {
     const plugin = existingPlugin ?? await requirePlugin(pluginId);
     assertTransition(plugin, to);
@@ -379,6 +385,7 @@ export function pluginLifecycleManager(
     const updated = await registry.updateStatus(pluginId, {
       status: to,
       lastError,
+      pendingManifest,
     });
 
     if (!updated) throw notFound(`Plugin not found after status update: ${pluginId}`);
@@ -453,62 +460,53 @@ export function pluginLifecycleManager(
   }
 
   /**
-   * Refuse to activate a plugin whose on-disk package still declares
-   * capabilities the stored grant does not carry.
+   * Refuse to enable a plugin whose held upgrade still declares capabilities
+   * the stored grant does not carry.
    *
    * Only called for `upgrade_pending`, where a capability escalation is known
-   * to be awaiting an operator decision. It fails closed: a package that cannot
-   * be read cannot be shown to grant nothing, and activation would fail on it
-   * anyway.
+   * to be awaiting an operator decision. Diffs against `pendingManifestJson`
+   * — the manifest `upgrade()` captured and persisted when it parked the
+   * plugin — rather than re-reading the package from disk: the package on
+   * disk is unapproved, so this check must never execute it. That capture
+   * happened at the one legitimate point the package's code may run, an
+   * explicit operator-invoked `upgrade()` call (§15.3, §15.4).
    *
-   * Reading the capability delta loads the package's manifest module. That is
-   * acceptable here — enabling activates the plugin, which loads the package
-   * regardless — but not on the diagnostic read paths, which use the
-   * non-executing `inspectManifestDrift` instead.
+   * Fails closed: a plugin sitting in `upgrade_pending` with no recorded
+   * pending manifest (e.g. a row from before this field existed) cannot be
+   * shown to grant nothing, so enabling it is refused until the upgrade is
+   * re-run and repopulates it.
    */
   async function assertPendingUpgradeGrantsNothing(plugin: PluginRecord): Promise<void> {
-    if (typeof pluginLoaderInstance.inspectPackageCapabilityDrift !== "function") {
+    const pending = plugin.pendingManifestJson;
+    if (!pending) {
       throw badRequest(
-        `Cannot enable plugin '${plugin.pluginKey}': its pending upgrade cannot be checked for `
-          + `capability escalation on this host. Re-run the upgrade with an explicit approval.`,
+        `Cannot enable plugin '${plugin.pluginKey}': it is in 'upgrade_pending' status but has no `
+          + `recorded pending manifest to check for capability escalation. Re-run the upgrade with `
+          + `an explicit approval, or uninstall the plugin to reject it.`,
       );
     }
 
-    let drift: PluginPackageCapabilityDrift;
-    try {
-      drift = await pluginLoaderInstance.inspectPackageCapabilityDrift(plugin);
-    } catch (err) {
-      throw badRequest(
-        `Cannot enable plugin '${plugin.pluginKey}': the pending upgrade package on disk could not `
-          + `be read (${err instanceof Error ? err.message : String(err)}).`,
-      );
-    }
+    const storedCaps = new Set(plugin.manifestJson?.capabilities ?? []);
+    const pendingCaps = pending.capabilities ?? [];
+    const addedCapabilities = pendingCaps.filter((c) => !storedCaps.has(c));
 
-    if (!drift.packageReadable) {
-      throw badRequest(
-        `Cannot enable plugin '${plugin.pluginKey}': the pending upgrade package on disk could not `
-          + `be read (${drift.error ?? "unknown error"}).`,
-      );
-    }
-
-    if (drift.addedCapabilities.length === 0) return;
+    if (addedCapabilities.length === 0) return;
 
     log.warn(
       {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
-        addedCapabilities: drift.addedCapabilities,
-        storedVersion: drift.storedVersion,
-        packageVersion: drift.packageVersion,
+        addedCapabilities,
+        storedVersion: plugin.version,
+        pendingVersion: pending.version,
       },
       "plugin lifecycle: refused to enable a pending upgrade that would grant unapproved capabilities",
     );
 
     throw badRequest(
-      `Cannot enable plugin '${plugin.pluginKey}': the package on disk (v${drift.packageVersion}) `
-        + `declares capabilities that were never approved: ${drift.addedCapabilities.join(", ")}. `
-        + `Approve them by re-running the upgrade with 'approveCapabilities', or uninstall the `
-        + `plugin to reject it.`,
+      `Cannot enable plugin '${plugin.pluginKey}': the held upgrade (v${pending.version}) declares `
+        + `capabilities that were never approved: ${addedCapabilities.join(", ")}. Approve them by `
+        + `re-running the upgrade with 'approveCapabilities', or uninstall the plugin to reject it.`,
     );
   }
 
@@ -784,8 +782,11 @@ export function pluginLifecycleManager(
           { pluginId, pluginKey: plugin.pluginKey, addedCapabilities },
           "plugin lifecycle: new capabilities detected, transitioning to upgrade_pending",
         );
-        // Skip the inner stopWorkerIfRunning since we already stopped above
-        const result = await transition(pluginId, "upgrade_pending", null, plugin);
+        // Skip the inner stopWorkerIfRunning since we already stopped above.
+        // `newManifest` was already loaded by this operator-invoked call, so
+        // persisting it here lets the enable gate diff the pending
+        // capability delta later without re-importing the manifest module.
+        const result = await transition(pluginId, "upgrade_pending", null, plugin, newManifest);
         emitDomain("plugin.upgrade_pending", {
           pluginId,
           pluginKey: result.pluginKey,

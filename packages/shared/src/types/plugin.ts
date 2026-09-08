@@ -745,6 +745,21 @@ export interface PluginRecord {
   categories: PluginCategory[];
   /** Full manifest snapshot persisted at install/upgrade time. */
   manifestJson: PaperclipPluginManifestV1;
+  /**
+   * sha256 of the manifest module's raw source bytes, captured alongside
+   * `manifestJson`. Lets diagnostic read routes detect a package swapped in
+   * place under the same `package.json` version without importing the
+   * manifest module. Null for rows written before this field existed, until
+   * their next install/upgrade/activation.
+   */
+  manifestSourceHash: string | null;
+  /**
+   * Manifest captured from an `upgrade()` call whose capability escalation is
+   * awaiting operator approval. Set only while `status` is `upgrade_pending`;
+   * null otherwise. Lets the enable gate diff the pending capability delta
+   * without re-executing the manifest module.
+   */
+  pendingManifestJson: PaperclipPluginManifestV1 | null;
   /** Current lifecycle status. */
   status: PluginStatus;
   /** Deterministic load order (null if not yet assigned). */
@@ -765,8 +780,10 @@ export interface PluginRecord {
  *
  * A package swapped in place leaves the stored grant untouched until the next
  * activation, so the running code and the granted capability set can diverge.
- * This shape is read from `package.json` alone and never executes plugin code,
- * so it is safe on diagnostic read routes. See PLUGIN_SPEC.md §15.4.
+ * Computed from `package.json` and a hash of the manifest file's raw bytes;
+ * neither is ever imported, so this is safe on diagnostic read routes even
+ * though it also catches a package replaced under the *same* `package.json`
+ * version. See PLUGIN_SPEC.md §15.4.
  */
 export interface PluginManifestDrift {
   /** False when the package on disk could not be read (see `error`). */
@@ -780,22 +797,6 @@ export interface PluginManifestDrift {
   manifestPresent: boolean;
   /** Why the package could not be read, when `packageReadable` is false. */
   error?: string;
-}
-
-/**
- * Manifest drift including the capability delta.
- *
- * A v1 manifest is an executable module, so reading the capabilities a package
- * declares means importing it and running its top-level code. That is only
- * acceptable on lifecycle operations that already load the package (install,
- * upgrade, activation); diagnostic read routes get the non-executing
- * `PluginManifestDrift` instead. See PLUGIN_SPEC.md §15.4.
- */
-export interface PluginPackageCapabilityDrift extends PluginManifestDrift {
-  /** Capabilities the package declares that were never granted to the plugin. */
-  addedCapabilities: string[];
-  /** Capabilities still granted that the package no longer declares. */
-  removedCapabilities: string[];
 }
 
 export interface PluginDatabaseNamespaceRecord {
